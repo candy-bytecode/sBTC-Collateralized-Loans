@@ -217,3 +217,72 @@
       (try! (as-contract (stx-transfer? (get collateral-amount loan) tx-sender caller)))
       
       (ok (map-set active-loans loan-id (merge loan {paid-back: true}))))))
+
+Liquidate overdue loan
+(define-public (liquidate-loan (loan-id uint))
+  (let ((loan (unwrap! (map-get? active-loans loan-id) err-not-found)))
+    (asserts! (not (var-get contract-paused)) err-contract-paused)
+    (asserts! (> block-height (+ (get due-block loan) (get grace-period loan))) err-loan-not-due)
+    (asserts! (not (get paid-back loan)) err-loan-active)
+    (asserts! (not (get liquidated loan)) err-already-liquidated)
+    
+    (try! (as-contract (stx-transfer? (get collateral-amount loan) tx-sender (get lender loan))))
+    (try! (update-user-stats (get borrower loan) u0 u0 u0 u0 u1))
+    
+    (ok (map-set active-loans loan-id (merge loan {liquidated: true})))))
+
+;; Emergency liquidation for under-collateralized loans
+(define-public (emergency-liquidate (loan-id uint))
+  (let ((loan (unwrap! (map-get? active-loans loan-id) err-not-found))
+        (liquidation-ratio (calculate-liquidation-risk loan-id)))
+    (asserts! (not (var-get contract-paused)) err-contract-paused)
+    (asserts! (< liquidation-ratio (var-get liquidation-threshold)) err-insufficient-collateral)
+    (asserts! (not (get paid-back loan)) err-loan-active)
+    (asserts! (not (get liquidated loan)) err-already-liquidated)
+    
+    (try! (as-contract (stx-transfer? (get collateral-amount loan) tx-sender (get lender loan))))
+    (try! (update-user-stats (get borrower loan) u0 u0 u0 u0 u1))
+    
+    (ok (map-set active-loans loan-id (merge loan {liquidated: true})))))
+
+;; Extend loan duration (with agreement from lender)
+(define-public (extend-loan (loan-id uint) (additional-blocks uint) (additional-interest uint))
+  (let ((caller tx-sender)
+        (loan (unwrap! (map-get? active-loans loan-id) err-not-found)))
+    (asserts! (not (var-get contract-paused)) err-contract-paused)
+    (asserts! (is-eq caller (get lender loan)) err-unauthorized)
+    (asserts! (not (get paid-back loan)) err-loan-active)
+    (asserts! (not (get liquidated loan)) err-loan-active)
+    (asserts! (<= additional-blocks (var-get max-offer-duration)) err-invalid-amount)
+    
+    (let ((new-due-block (+ (get due-block loan) additional-blocks))
+          (new-total-due (+ (get total-due loan) additional-interest)))
+      
+      (ok (map-set active-loans loan-id 
+        (merge loan {
+          due-block: new-due-block,
+          total-due: new-total-due
+        }))))))
+
+;; Withdraw available collateral
+(define-public (withdraw-collateral (amount uint))
+  (let ((caller tx-sender)
+        (available-collateral (default-to u0 (map-get? user-collateral caller))))
+    (asserts! (not (var-get contract-paused)) err-contract-paused)
+    (asserts! (>= available-collateral amount) err-insufficient-collateral)
+    
+    (try! (as-contract (stx-transfer? amount tx-sender caller)))
+    
+    (ok (map-set user-collateral caller (- available-collateral amount)))))
+
+;; Cancel active loan offer
+(define-public (cancel-loan-offer (offer-id uint))
+  (let ((caller tx-sender)
+        (offer (unwrap! (map-get? loan-offers offer-id) err-not-found)))
+    (asserts! (not (var-get contract-paused)) err-contract-paused)
+    (asserts! (is-eq caller (get lender offer)) err-unauthorized)
+    (asserts! (get active offer) err-not-found)
+    
+    (try! (as-contract (stx-transfer? (get amount offer) tx-sender caller)))
+    
+    (ok (map-set loan-offers offer-id (merge offer {active: false})))))
