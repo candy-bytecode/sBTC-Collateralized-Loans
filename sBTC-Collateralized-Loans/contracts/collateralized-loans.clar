@@ -90,3 +90,130 @@
 (define-data-var platform-fee-recipient principal contract-owner)
 (define-data-var grace-period-blocks uint u144) ;; ~24 hours in blocks
 (define-data-var max-offer-duration uint u52560) ;; ~1 year in blocks
+
+;; Create a new loan offer
+(define-public (create-loan-offer 
+  (amount uint)
+  (interest-rate uint)
+  (collateral-ratio uint)
+  (duration uint))
+  (let ((caller tx-sender)
+        (offer-id (var-get next-offer-id)))
+    (asserts! (not (var-get contract-paused)) err-contract-paused)
+    (asserts! (and (>= amount min-loan-amount) (<= amount max-loan-amount)) err-invalid-amount)
+    (asserts! (and (>= interest-rate min-interest-rate) (<= interest-rate max-interest-rate)) err-invalid-rate)
+    (asserts! (and (>= collateral-ratio min-collateral-ratio) (<= collateral-ratio max-collateral-ratio)) err-invalid-ratio)
+    (asserts! (<= duration (var-get max-offer-duration)) err-invalid-amount)
+    (asserts! (>= (stx-get-balance caller) amount) err-insufficient-collateral)
+    
+    (try! (stx-transfer? amount caller (as-contract tx-sender)))
+    
+    (map-set loan-offers offer-id {
+      lender: caller,
+      amount: amount,
+      interest-rate: interest-rate,
+      collateral-ratio: collateral-ratio,
+      duration: duration,
+      active: true,
+      created-at: block-height,
+      expires-at: (+ block-height u8760) ;; Offer expires in ~60 days
+    })
+    
+    (try! (update-user-stats caller u0 amount u0 u1 u0))
+    (var-set next-offer-id (+ offer-id u1))
+    (ok offer-id)))
+
+;; Deposit collateral
+(define-public (deposit-collateral (amount uint))
+  (let ((caller tx-sender))
+    (asserts! (not (var-get contract-paused)) err-contract-paused)
+    (asserts! (>= amount min-loan-amount) err-invalid-amount)
+    (asserts! (>= (stx-get-balance caller) amount) err-insufficient-collateral)
+    
+    (try! (stx-transfer? amount caller (as-contract tx-sender)))
+    
+    (let ((current-collateral (default-to u0 (map-get? user-collateral caller))))
+      (ok (map-set user-collateral caller (+ current-collateral amount))))))
+
+;; Take a loan
+(define-public (take-loan (offer-id uint))
+  (let ((caller tx-sender)
+        (offer (unwrap! (map-get? loan-offers offer-id) err-not-found))
+        (loan-id (var-get next-loan-id))
+        (user-collateral-amount (default-to u0 (map-get? user-collateral caller))))
+    (asserts! (not (var-get contract-paused)) err-contract-paused)
+    (asserts! (get active offer) err-not-found)
+    (asserts! (< block-height (get expires-at offer)) err-payment-overdue)
+    
+    (let ((required-collateral (* (get amount offer) (get collateral-ratio offer)))
+          (required-collateral-adjusted (/ required-collateral u100)))
+      (asserts! (>= user-collateral-amount required-collateral-adjusted) err-insufficient-collateral)
+      
+      (let ((interest-amount (/ (* (get amount offer) (get interest-rate offer)) u100))
+            (total-due (+ (get amount offer) interest-amount))
+            (platform-fee (/ (* (get amount offer) platform-fee-rate) u10000)))
+        
+        (try! (as-contract (stx-transfer? (get amount offer) tx-sender caller)))
+        (try! (as-contract (stx-transfer? platform-fee tx-sender (var-get platform-fee-recipient))))
+        
+        (map-set active-loans loan-id {
+          borrower: caller,
+          lender: (get lender offer),
+          principal-amount: (get amount offer),
+          collateral-amount: required-collateral-adjusted,
+          interest-rate: (get interest-rate offer),
+          start-block: block-height,
+          due-block: (+ block-height (get duration offer)),
+          total-due: total-due,
+          paid-back: false,
+          liquidated: false,
+          partial-payments: u0,
+          grace-period: (var-get grace-period-blocks)
+        })
+        
+        (map-set user-collateral caller (- user-collateral-amount required-collateral-adjusted))
+        (map-set loan-offers offer-id (merge offer {active: false}))
+        (try! (update-user-stats caller (get amount offer) u0 u1 u0 u0))
+        (try! (update-platform-stats (get amount offer) platform-fee))
+        (var-set next-loan-id (+ loan-id u1))
+        
+        (ok loan-id)))))
+
+;; Make partial payment
+(define-public (make-partial-payment (loan-id uint) (payment-amount uint))
+  (let ((caller tx-sender)
+        (loan (unwrap! (map-get? active-loans loan-id) err-not-found)))
+    (asserts! (not (var-get contract-paused)) err-contract-paused)
+    (asserts! (is-eq caller (get borrower loan)) err-unauthorized)
+    (asserts! (not (get paid-back loan)) err-loan-active)
+    (asserts! (not (get liquidated loan)) err-loan-active)
+    (asserts! (>= (stx-get-balance caller) payment-amount) err-insufficient-collateral)
+    (asserts! (<= payment-amount (- (get total-due loan) (get partial-payments loan))) err-invalid-amount)
+    
+    (try! (stx-transfer? payment-amount caller (get lender loan)))
+    
+    (let ((new-partial-payments (+ (get partial-payments loan) payment-amount)))
+      (if (>= new-partial-payments (get total-due loan))
+        ;; Full payment made
+        (begin
+          (try! (as-contract (stx-transfer? (get collateral-amount loan) tx-sender caller)))
+          (ok (map-set active-loans loan-id (merge loan {paid-back: true, partial-payments: new-partial-payments}))))
+        ;; Partial payment only
+        (ok (map-set active-loans loan-id (merge loan {partial-payments: new-partial-payments})))))))
+
+;; Repay loan in full
+(define-public (repay-loan (loan-id uint))
+  (let ((caller tx-sender)
+        (loan (unwrap! (map-get? active-loans loan-id) err-not-found)))
+    (asserts! (not (var-get contract-paused)) err-contract-paused)
+    (asserts! (is-eq caller (get borrower loan)) err-unauthorized)
+    (asserts! (not (get paid-back loan)) err-loan-active)
+    (asserts! (not (get liquidated loan)) err-loan-active)
+    
+    (let ((remaining-due (- (get total-due loan) (get partial-payments loan))))
+      (asserts! (>= (stx-get-balance caller) remaining-due) err-insufficient-collateral)
+      
+      (try! (stx-transfer? remaining-due caller (get lender loan)))
+      (try! (as-contract (stx-transfer? (get collateral-amount loan) tx-sender caller)))
+      
+      (ok (map-set active-loans loan-id (merge loan {paid-back: true}))))))
