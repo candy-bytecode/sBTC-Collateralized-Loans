@@ -286,3 +286,123 @@ Liquidate overdue loan
     (try! (as-contract (stx-transfer? (get amount offer) tx-sender caller)))
     
     (ok (map-set loan-offers offer-id (merge offer {active: false})))))
+
+Read-only functions
+(define-read-only (get-loan-offer (offer-id uint))
+  (map-get? loan-offers offer-id))
+
+(define-read-only (get-loan-info (loan-id uint))
+  (map-get? active-loans loan-id))
+
+(define-read-only (get-user-collateral (user principal))
+  (default-to u0 (map-get? user-collateral user)))
+
+(define-read-only (get-user-stats (user principal))
+  (default-to {
+    total-borrowed: u0,
+    total-lent: u0,
+    loans-taken: u0,
+    loans-given: u0,
+    defaults: u0,
+    reputation-score: u100
+  } (map-get? user-stats user)))
+
+(define-read-only (calculate-liquidation-risk (loan-id uint))
+  (let ((loan (map-get? active-loans loan-id)))
+    (match loan
+      loan-data
+      (let ((collateral-value (get collateral-amount loan-data))
+            (debt-value (- (get total-due loan-data) (get partial-payments loan-data))))
+        (if (> debt-value u0)
+          (/ (* collateral-value u100) debt-value)
+          u0))
+      u0)))
+
+(define-read-only (get-loan-health (loan-id uint))
+  (let ((loan (map-get? active-loans loan-id)))
+    (match loan
+      loan-data
+      (let ((blocks-remaining (- (get due-block loan-data) block-height))
+            (payment-progress (/ (* (get partial-payments loan-data) u100) (get total-due loan-data)))
+            (collateral-ratio (calculate-liquidation-risk loan-id)))
+        {
+          blocks-remaining: blocks-remaining,
+          payment-progress: payment-progress,
+          collateral-ratio: collateral-ratio,
+          is-healthy: (and (> blocks-remaining u0) (>= collateral-ratio (var-get liquidation-threshold)))
+        })
+      {
+        blocks-remaining: u0,
+        payment-progress: u0,
+        collateral-ratio: u0,
+        is-healthy: false
+      })))
+
+;; Administrative functions
+(define-public (set-liquidation-threshold (new-threshold uint))
+  (begin
+    (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+    (asserts! (and (>= new-threshold u110) (<= new-threshold u200)) err-invalid-ratio)
+    (ok (var-set liquidation-threshold new-threshold))))
+
+(define-public (set-platform-fee-rate (new-rate uint))
+  (begin
+    (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+    (asserts! (<= new-rate u100) err-invalid-rate) ;; Max 1%
+    (ok (var-set platform-fee-rate new-rate))))
+
+(define-public (toggle-contract-pause)
+  (begin
+    (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+    (ok (var-set contract-paused (not (var-get contract-paused))))))
+
+(define-public (set-grace-period (new-period uint))
+  (begin
+    (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+    (asserts! (<= new-period u1008) err-invalid-amount) ;; Max 1 week
+    (ok (var-set grace-period-blocks new-period))))
+
+;; Helper functions
+(define-private (update-user-stats 
+  (user principal)
+  (borrowed uint)
+  (lent uint)
+  (loans-taken uint)
+  (loans-given uint)
+  (defaults uint))
+  (let ((current-stats (get-user-stats user)))
+    (ok (map-set user-stats user {
+      total-borrowed: (+ (get total-borrowed current-stats) borrowed),
+      total-lent: (+ (get total-lent current-stats) lent),
+      loans-taken: (+ (get loans-taken current-stats) loans-taken),
+      loans-given: (+ (get loans-given current-stats) loans-given),
+      defaults: (+ (get defaults current-stats) defaults),
+      reputation-score: (if (> defaults u0)
+        (max (- (get reputation-score current-stats) u10) u0)
+        (min (+ (get reputation-score current-stats) u1) u100))
+    }))))
+
+(define-private (update-platform-stats (volume uint) (fees uint))
+  (let ((current-stats (default-to {
+    total-loans-created: u0,
+    total-volume: u0,
+    total-fees-collected: u0,
+    active-loans-count: u0,
+    liquidated-loans-count: u0
+  } (map-get? platform-stats u0))))
+    (ok (map-set platform-stats u0 {
+      total-loans-created: (+ (get total-loans-created current-stats) u1),
+      total-volume: (+ (get total-volume current-stats) volume),
+      total-fees-collected: (+ (get total-fees-collected current-stats) fees),
+      active-loans-count: (+ (get active-loans-count current-stats) u1),
+      liquidated-loans-count: (get liquidated-loans-count current-stats)
+    }))))
+
+(define-read-only (get-platform-stats)
+  (default-to {
+    total-loans-created: u0,
+    total-volume: u0,
+    total-fees-collected: u0,
+    active-loans-count: u0,
+    liquidated-loans-count: u0
+  } (map-get? platform-stats u0)))
