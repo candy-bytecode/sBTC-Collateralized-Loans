@@ -218,7 +218,7 @@
       
       (ok (map-set active-loans loan-id (merge loan {paid-back: true}))))))
 
-Liquidate overdue loan
+;; Liquidate overdue loan
 (define-public (liquidate-loan (loan-id uint))
   (let ((loan (unwrap! (map-get? active-loans loan-id) err-not-found)))
     (asserts! (not (var-get contract-paused)) err-contract-paused)
@@ -287,7 +287,7 @@ Liquidate overdue loan
     
     (ok (map-set loan-offers offer-id (merge offer {active: false})))))
 
-Read-only functions
+;; Read-only functions
 (define-read-only (get-loan-offer (offer-id uint))
   (map-get? loan-offers offer-id))
 
@@ -378,8 +378,12 @@ Read-only functions
       loans-given: (+ (get loans-given current-stats) loans-given),
       defaults: (+ (get defaults current-stats) defaults),
       reputation-score: (if (> defaults u0)
-        (max (- (get reputation-score current-stats) u10) u0)
-        (min (+ (get reputation-score current-stats) u1) u100))
+        (if (>= (get reputation-score current-stats) u10)
+          (- (get reputation-score current-stats) u10)
+          u0)
+        (if (<= (get reputation-score current-stats) u99)
+          (+ (get reputation-score current-stats) u1)
+          u100))
     }))))
 
 (define-private (update-platform-stats (volume uint) (fees uint))
