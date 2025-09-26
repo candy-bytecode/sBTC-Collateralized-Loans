@@ -6,7 +6,6 @@
 (define-constant max-interest-rate u50) ;; 50% maximum
 (define-constant min-collateral-ratio u110) ;; 110% minimum
 (define-constant max-collateral-ratio u500) ;; 500% maximum
-(define-constant platform-fee-rate u25) ;; 0.25% platform fee
 
 ;; Error constants
 (define-constant err-owner-only (err u100))
@@ -82,7 +81,7 @@
     liquidated-loans-count: uint
   })
 
-;; Data variables
+;; Data variables (changed platform-fee-rate from constant to data variable)
 (define-data-var next-offer-id uint u1)
 (define-data-var next-loan-id uint u1)
 (define-data-var liquidation-threshold uint u150) ;; 150% collateral ratio
@@ -90,6 +89,7 @@
 (define-data-var platform-fee-recipient principal contract-owner)
 (define-data-var grace-period-blocks uint u144) ;; ~24 hours in blocks
 (define-data-var max-offer-duration uint u52560) ;; ~1 year in blocks
+(define-data-var platform-fee-rate uint u25) ;; 0.25% platform fee
 
 ;; Create a new loan offer
 (define-public (create-loan-offer 
@@ -115,11 +115,11 @@
       collateral-ratio: collateral-ratio,
       duration: duration,
       active: true,
-      created-at: block-height,
-      expires-at: (+ block-height u8760) ;; Offer expires in ~60 days
+      created-at: stacks-block-height,
+      expires-at: (+ stacks-block-height u8760) ;; Offer expires in ~60 days
     })
     
-    (try! (update-user-stats caller u0 amount u0 u1 u0))
+    (update-user-stats caller u0 amount u0 u1 u0)
     (var-set next-offer-id (+ offer-id u1))
     (ok offer-id)))
 
@@ -143,7 +143,7 @@
         (user-collateral-amount (default-to u0 (map-get? user-collateral caller))))
     (asserts! (not (var-get contract-paused)) err-contract-paused)
     (asserts! (get active offer) err-not-found)
-    (asserts! (< block-height (get expires-at offer)) err-payment-overdue)
+    (asserts! (< stacks-block-height (get expires-at offer)) err-payment-overdue)
     
     (let ((required-collateral (* (get amount offer) (get collateral-ratio offer)))
           (required-collateral-adjusted (/ required-collateral u100)))
@@ -151,7 +151,7 @@
       
       (let ((interest-amount (/ (* (get amount offer) (get interest-rate offer)) u100))
             (total-due (+ (get amount offer) interest-amount))
-            (platform-fee (/ (* (get amount offer) platform-fee-rate) u10000)))
+            (platform-fee (/ (* (get amount offer) (var-get platform-fee-rate)) u10000)))
         
         (try! (as-contract (stx-transfer? (get amount offer) tx-sender caller)))
         (try! (as-contract (stx-transfer? platform-fee tx-sender (var-get platform-fee-recipient))))
@@ -162,8 +162,8 @@
           principal-amount: (get amount offer),
           collateral-amount: required-collateral-adjusted,
           interest-rate: (get interest-rate offer),
-          start-block: block-height,
-          due-block: (+ block-height (get duration offer)),
+          start-block: stacks-block-height,
+          due-block: (+ stacks-block-height (get duration offer)),
           total-due: total-due,
           paid-back: false,
           liquidated: false,
@@ -173,8 +173,8 @@
         
         (map-set user-collateral caller (- user-collateral-amount required-collateral-adjusted))
         (map-set loan-offers offer-id (merge offer {active: false}))
-        (try! (update-user-stats caller (get amount offer) u0 u1 u0 u0))
-        (try! (update-platform-stats (get amount offer) platform-fee))
+        (update-user-stats caller (get amount offer) u0 u1 u0 u0)
+        (update-platform-stats (get amount offer) platform-fee)
         (var-set next-loan-id (+ loan-id u1))
         
         (ok loan-id)))))
@@ -222,12 +222,12 @@
 (define-public (liquidate-loan (loan-id uint))
   (let ((loan (unwrap! (map-get? active-loans loan-id) err-not-found)))
     (asserts! (not (var-get contract-paused)) err-contract-paused)
-    (asserts! (> block-height (+ (get due-block loan) (get grace-period loan))) err-loan-not-due)
+    (asserts! (> stacks-block-height (+ (get due-block loan) (get grace-period loan))) err-loan-not-due)
     (asserts! (not (get paid-back loan)) err-loan-active)
     (asserts! (not (get liquidated loan)) err-already-liquidated)
     
     (try! (as-contract (stx-transfer? (get collateral-amount loan) tx-sender (get lender loan))))
-    (try! (update-user-stats (get borrower loan) u0 u0 u0 u0 u1))
+    (update-user-stats (get borrower loan) u0 u0 u0 u0 u1)
     
     (ok (map-set active-loans loan-id (merge loan {liquidated: true})))))
 
@@ -241,7 +241,7 @@
     (asserts! (not (get liquidated loan)) err-already-liquidated)
     
     (try! (as-contract (stx-transfer? (get collateral-amount loan) tx-sender (get lender loan))))
-    (try! (update-user-stats (get borrower loan) u0 u0 u0 u0 u1))
+    (update-user-stats (get borrower loan) u0 u0 u0 u0 u1)
     
     (ok (map-set active-loans loan-id (merge loan {liquidated: true})))))
 
@@ -322,7 +322,7 @@
   (let ((loan (map-get? active-loans loan-id)))
     (match loan
       loan-data
-      (let ((blocks-remaining (- (get due-block loan-data) block-height))
+      (let ((blocks-remaining (- (get due-block loan-data) stacks-block-height))
             (payment-progress (/ (* (get partial-payments loan-data) u100) (get total-due loan-data)))
             (collateral-ratio (calculate-liquidation-risk loan-id)))
         {
@@ -371,7 +371,7 @@
   (loans-given uint)
   (defaults uint))
   (let ((current-stats (get-user-stats user)))
-    (ok (map-set user-stats user {
+    (map-set user-stats user {
       total-borrowed: (+ (get total-borrowed current-stats) borrowed),
       total-lent: (+ (get total-lent current-stats) lent),
       loans-taken: (+ (get loans-taken current-stats) loans-taken),
@@ -384,7 +384,7 @@
         (if (<= (get reputation-score current-stats) u99)
           (+ (get reputation-score current-stats) u1)
           u100))
-    }))))
+    })))
 
 (define-private (update-platform-stats (volume uint) (fees uint))
   (let ((current-stats (default-to {
@@ -394,13 +394,13 @@
     active-loans-count: u0,
     liquidated-loans-count: u0
   } (map-get? platform-stats u0))))
-    (ok (map-set platform-stats u0 {
+    (map-set platform-stats u0 {
       total-loans-created: (+ (get total-loans-created current-stats) u1),
       total-volume: (+ (get total-volume current-stats) volume),
       total-fees-collected: (+ (get total-fees-collected current-stats) fees),
       active-loans-count: (+ (get active-loans-count current-stats) u1),
       liquidated-loans-count: (get liquidated-loans-count current-stats)
-    }))))
+    })))
 
 (define-read-only (get-platform-stats)
   (default-to {
